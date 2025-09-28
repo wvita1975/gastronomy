@@ -3,7 +3,7 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.conf import settings
 from django.utils import timezone
-
+from django.db import transaction
 
 class Usuario(AbstractUser):
     ROLES = [
@@ -186,7 +186,7 @@ class Almacen(models.Model):
 class CategoriaArticulo(models.Model):
     nombre = models.CharField(max_length=100)
     descripcion = models.TextField(blank=True)
-
+    
     codigo_categoria = models.CharField(
         max_length=10,
         unique=True,
@@ -201,7 +201,7 @@ class CategoriaArticulo(models.Model):
                 nuevo_numero = int(ultimo.codigo_categoria[1:]) + 1
             else:
                 nuevo_numero = 1
-            self.codigo_categoria = f"T{str(nuevo_numero).zfill()}"
+            self.codigo_categoria = f"T{str(nuevo_numero).zfill(5)}"
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -210,49 +210,47 @@ class CategoriaArticulo(models.Model):
 
 # Modelo para artículos
 
-class Articulo(models.Model):
+UNIDADES_CHOICES = [
+    ('unidad', 'Unidad'),
+    ('kg', 'Kilogramo'),
+    ('lt', 'Litro'),
+    ('m', 'Metro'),
+    ('cm', 'Centímetro'),
+    ('g', 'Gramo'),
+    ('ml', 'Mililitro'),
+]
+
+class Categoria(models.Model):
     nombre = models.CharField(max_length=100)
-    categoria = models.ForeignKey('CategoriaArticulo', on_delete=models.PROTECT)
-    almacen = models.ForeignKey('Almacen', on_delete=models.PROTECT)
-    precio_unitario = models.DecimalField(max_digits=10, decimal_places=2)
-    cantidad = models.PositiveIntegerField(default=0)
-
-    codigo_articulo = models.CharField(
-        max_length=6,  # A + 5 dígitos
-        unique=True,
-        editable=False,
-        blank=True
-    )
-
-    def save(self, *args, **kwargs):
-        es_nuevo = not self.pk
-
-        if not self.codigo_articulo:
-            base_numero = 1
-            while True:
-                nuevo_codigo = f"A{str(base_numero).zfill(5)}"
-                if not Articulo.objects.filter(codigo_articulo=nuevo_codigo).exists():
-                    self.codigo_articulo = nuevo_codigo
-                    break
-                base_numero += 1
-
-        super().save(*args, **kwargs)
-
-        if es_nuevo and self.cantidad > 0:
-            from core.models import MovimientoInventario
-            MovimientoInventario.objects.create(
-                articulo=self,
-                tipo='entrada',
-                cantidad=self.cantidad,
-                almacen=self.almacen,
-                observacion='Carga inicial automática al crear el artículo'
-            )
 
     def __str__(self):
-        return f"{self.codigo_articulo} - {self.nombre}"
+        return self.nombre
 
+class Articulo(models.Model):
+    nombre = models.CharField(max_length=100)
+    categoria = models.ForeignKey(CategoriaArticulo, on_delete=models.CASCADE)
+    codigo = models.CharField(max_length=6, unique=True, editable=False)
+    unidad = models.CharField(max_length=10, choices=UNIDADES_CHOICES, default='unidad')
+    cantidad = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    almacen = models.ForeignKey('Almacen', on_delete=models.PROTECT)
     
-#  de movimientos de inventario
+    def save(self, *args, **kwargs):
+        if not self.codigo:
+            ultimo = Articulo.objects.order_by('-id').first()
+            siguiente_numero = 1 if not ultimo else ultimo.id + 1
+            self.codigo = f"A{siguiente_numero:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.nombre} ({self.codigo})"
+
+
+def __str__(self):
+    if self.articulo_id:
+        return f"{self.tipo.capitalize()} de {self.articulo.nombre}"
+    return "Movimiento sin artículo"
+    
+#####  Modelo de movimientos de inventario
 
 class MovimientoInventario(models.Model):
     TIPO_MOVIMIENTO = [
@@ -270,10 +268,13 @@ class MovimientoInventario(models.Model):
 
     articulo = models.ForeignKey('Articulo', on_delete=models.CASCADE)
     tipo = models.CharField(max_length=10, choices=TIPO_MOVIMIENTO)
-    cantidad = models.IntegerField()
+    cantidad = models.DecimalField(max_digits=10, decimal_places=2)
     fecha = models.DateTimeField(auto_now_add=True)
-    observacion = models.TextField(blank=True)
     almacen = models.ForeignKey('Almacen', on_delete=models.PROTECT)
+    orden_servicio = models.ForeignKey('OrdenServicio', null=True, blank=True, on_delete=models.SET_NULL)
+    creado_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    descripcion = models.TextField(blank=True)
 
     motivo_ajuste = models.CharField(
         max_length=100,
@@ -281,10 +282,49 @@ class MovimientoInventario(models.Model):
         help_text="Solo se usa si el tipo de movimiento es 'ajuste'. Ej: pérdida, corrección, sobrante"
     )
 
-    def save(self, *args, **kwargs):
-        es_nuevo = not self.pk
+    def __str__(self):
+        if self.articulo_id:
+            return f"{self.codigo_movimiento} - {self.tipo.capitalize()} {self.articulo.nombre} ({self.cantidad}) en {self.almacen.nombre}"
+        return "Movimiento sin artículo"
 
-        # Generar código único tipo M000001 solo al crear
+    def clean(self):
+        super().clean()
+        
+        # 1. Validación de la cantidad de entrada/salida (debe ser positiva)
+        if self.tipo in ['entrada', 'salida']:
+            if self.cantidad <= 0:
+                raise ValidationError({'cantidad': f'La cantidad para una {self.tipo} debe ser mayor a cero.'})
+        
+        # 2. Validación de ajustes (el signo se respeta)
+        elif self.tipo == 'ajuste':
+            if not self.motivo_ajuste:
+                raise ValidationError({'motivo_ajuste': 'Debe especificar el motivo del ajuste.'})
+        
+        # 3. Normalizar la cantidad para la validación de inventario
+        # Solo necesitamos que el valor sea negativo si va a restar stock.
+        cantidad_a_validar = self.cantidad
+        if self.tipo == 'salida':
+            cantidad_a_validar = -self.cantidad # La salida siempre resta
+        
+        # 4. Validar existencia SI el movimiento reduce inventario (cantidad_a_validar es < 0)
+        if cantidad_a_validar < 0:
+            # Si el artículo se mueve a un almacén diferente (no es el stock actual)
+            # Esto puede ser una validación compleja. Asumiremos que el stock del artículo 
+            # (self.articulo.cantidad) es el stock en el almacén de este movimiento (self.almacen).
+            
+            # Comprobar si al aplicar el movimiento (resta) el stock se vuelve negativo.
+            if self.articulo.cantidad + cantidad_a_validar < 0:
+                raise ValidationError({
+                    'cantidad': f'No hay suficiente inventario disponible en este almacén. Stock actual: {self.articulo.cantidad}, intento de retiro: {abs(cantidad_a_validar)}.'
+                })
+
+    def save(self, *args, **kwargs):
+        with transaction.atomic():
+            es_nuevo = not self.pk
+
+        # --- PRE-GUARDADO DEL MovimientoInventario ---
+
+        # Generar código único M000001 (Solo al crear)
         if es_nuevo and not self.codigo_movimiento:
             base_numero = 1
             while True:
@@ -294,54 +334,32 @@ class MovimientoInventario(models.Model):
                     break
                 base_numero += 1
 
-        # Normalizar cantidad para salidas
+        # NORMALIZAR LA CANTIDAD FINAL
+        # Esta será la cantidad que se guardará en el objeto.
         if self.tipo == 'salida':
-            if self.cantidad <= 0:
-                raise ValidationError('La cantidad en una salida debe ser positiva.')
+            # La cantidad que se guarda es NEGATIVA
             self.cantidad = -abs(self.cantidad)
+        elif self.tipo == 'entrada':
+            # La cantidad que se guarda es POSITIVA
+            self.cantidad = abs(self.cantidad)
+        # Para 'ajuste', la cantidad se respeta (puede ser +/-)
 
-        # Validación de ajustes
-        if self.tipo == 'ajuste':
-            if not self.motivo_ajuste:
-                raise ValidationError({'motivo_ajuste': 'Debe especificar el motivo del ajuste.'})
-
-        # Validar existencia si el movimiento reduce inventario
-        if self.cantidad < 0:
-            if self.articulo.almacen != self.almacen:
-                raise ValidationError('El artículo no está registrado en este almacén.')
-            if self.articulo.cantidad + self.cantidad < 0:
-                raise ValidationError('No hay suficiente inventario para realizar este movimiento.')
-
-        # Actualizar inventario
-        if self.articulo.almacen != self.almacen and self.tipo in ['entrada', 'ajuste']:
-            self.articulo.almacen = self.almacen
-
-        self.articulo.cantidad += self.cantidad
-        self.articulo.save()
+        # --- GUARDAR EL MovimientoInventario ---
         super().save(*args, **kwargs)
 
-    def __str__(self):
-        return f"{self.codigo_movimiento} - {self.tipo.capitalize()} {self.articulo.nombre} ({self.cantidad}) en {self.almacen.nombre}"
-    
-    def clean(self):
-    # Validar tipo y cantidad
-        if self.tipo == 'salida':
-            if self.cantidad <= 0:
-                raise ValidationError({'cantidad': 'La cantidad para una salida debe ser mayor a cero.'})
-        self.cantidad = -abs(self.cantidad)
-
-        if self.tipo == 'ajuste' and not self.motivo_ajuste:
-            raise ValidationError({'motivo_ajuste': 'Por favor indica el motivo del ajuste.'})
-
-    # Validar existencia si el movimiento reduce inventario
-        if self.cantidad < 0:
-            if self.articulo.almacen != self.almacen:
-                raise ValidationError({'almacen': 'Este artículo no está registrado en el almacén seleccionado.'})
-        if self.articulo.cantidad + self.cantidad < 0:
-            raise ValidationError({
-                'cantidad': f'No hay suficiente inventario disponible. Stock actual: {self.articulo.cantidad}, intento de retiro: {abs(self.cantidad)}.'
-            })
-
+        # --- POST-GUARDADO: ACTUALIZACIÓN DEL Articulo ---
+        # El cambio de stock solo debe aplicarse si el movimiento es NUEVO.
+        if es_nuevo:
+            # 1. Actualizar almacén (solo si la cantidad es positiva para un nuevo stock)
+            if self.articulo.almacen != self.almacen and self.cantidad > 0:
+                self.articulo.almacen = self.almacen
+            
+            # 2. Aplicar el cambio de stock
+            # Se usa self.cantidad, que ya está normalizada (+ para entrada, - para salida/ajuste negativo).
+            self.articulo.cantidad += self.cantidad
+            
+            # 3. Guardar el Artículo una sola vez
+            self.articulo.save(update_fields=['cantidad', 'almacen']) 
 
 # Modelo para órdenes de servicio
 

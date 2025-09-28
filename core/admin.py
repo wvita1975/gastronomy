@@ -1,14 +1,17 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
+from django import forms
 from .models import Usuario
 from .models import Cliente
 from .models import Proveedor
 from .models import Locacion
 from .models import Almacen
-from .models import Articulo
-from .models import MovimientoInventario
-from .models import OrdenServicio
-from .models import DetalleOrdenServicio
+from .models import MovimientoInventario, Articulo
+from .models import OrdenServicio, DetalleOrdenServicio
+from django.http import JsonResponse
+from django.urls import path
+from core.forms import MovimientoInventarioForm
+
 
 class UsuarioAdmin(UserAdmin):
     model = Usuario
@@ -55,7 +58,6 @@ class ClienteAdmin(admin.ModelAdmin):
         'mesa'
     )
 
-
 # Registro del modelo Proveedor en el admin
 
 @admin.register(Proveedor)
@@ -84,8 +86,12 @@ class CategoriaArticuloAdmin(admin.ModelAdmin):
 
 @admin.register(Articulo)
 class ArticuloAdmin(admin.ModelAdmin):
-    readonly_fields = ('codigo_articulo',)
-    list_display = ('codigo_articulo', 'nombre', 'categoria', 'almacen', 'precio_unitario', 'cantidad')
+    readonly_fields = ('codigo',)
+    list_display = ('codigo', 'nombre', 'categoria', 'unidad',)
+    fields = ('nombre', 'categoria', 'unidad')  # El campo 'codigo' es automático
+
+    search_fields = ('nombre', 'codigo_articulo')
+    list_filter = ('categoria', 'unidad')
 
 
 # Registro del modelo MovimientoInventario en el admin
@@ -93,6 +99,24 @@ class ArticuloAdmin(admin.ModelAdmin):
 @admin.register(MovimientoInventario)
 class MovimientoInventarioAdmin(admin.ModelAdmin):
     list_display = ('tipo', 'articulo', 'cantidad', 'fecha')
+    form = MovimientoInventarioForm
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path('core/articulo/<int:pk>/stock/', self.admin_site.admin_view(self.articulo_stock_view))
+        ]
+        return custom_urls + urls
+
+    def articulo_stock_view(self, request, pk):
+        try:
+            articulo = Articulo.objects.get(pk=pk)
+            return JsonResponse({'cantidad': float(articulo.cantidad)})
+        except Articulo.DoesNotExist:
+            return JsonResponse({'error': 'Artículo no encontrado'}, status=404)
+
+    class Media:
+        js = ['core/admin_stock.js']
 
 
 # Registro del modelo OrdenServicio y DetalleOrdenServicio en el admin
